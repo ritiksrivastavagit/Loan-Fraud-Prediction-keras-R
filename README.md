@@ -6,11 +6,11 @@ An R project to predict loan fraud using a Keras deep learning model. Features e
 
 This repository contains the R code for a deep learning model designed to predict loan application fraud. The project's core strategy is to perform advanced feature engineering by combining static loan application data with historical customer transaction data to build a rich behavioral profile for each applicant.
 
-#Project Objective
+# Project Objective
 
 The goal is to build, train, and tune a Keras neural network that can accurately identify the complex patterns associated with fraudulent loan applications. The model is trained on a synthetically balanced dataset (using ROSE) and evaluated on a real-world, unbalanced test set to prove its effectiveness.
 
-#Tech Stack
+# Tech Stack
 
 Language: R
 
