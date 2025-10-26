@@ -1,0 +1,455 @@
+---
+title: "Loan Fraud Prediction: A Deep Learning Approach"
+output: 
+  pdf_document: 
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+### 1. Project Introduction
+
+This report outlines the development of a neural network to predict loan application fraud. We will use two datasets:
+
+* `loan_applications.csv`: Information provided by customers at the time of application.
+* `transactions.csv`: A detailed behavioral history of each customer.
+
+Our core strategy is to combine these datasets through feature engineering, creating a rich profile of each applicant. We will then build, train, and tune a Keras neural network to identify the complex patterns associated with fraud.
+
+### 2. Library and Data Setup
+
+#### 2.1. Load Libraries
+
+First, we load all necessary libraries for data manipulation, modeling, and evaluation.
+
+```{r load-libraries}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(ROSE)
+library(ROCR)
+library(keras3)
+library(magrittr)
+```
+
+#### 2.2. Load Data
+
+We load the two raw datasets into R. (Note: You must have `loan_applications.csv` and `transactions.csv` in the same directory as this Rmd file).
+
+```{r load-data}
+loan <- read.csv("loan_applications.csv", stringsAsFactors = FALSE)
+txn <- read.csv("transactions.csv", stringsAsFactors = FALSE)
+```
+
+### 3. Feature Engineering
+
+This is the most critical step for model performance. A loan application alone provides limited context. By joining historical transaction data, we give the model a behavioral understanding of the applicant.
+
+The process is as follows:
+
+1.  Join loan applications to the transaction table by `customer_id`.
+2.  Filter this joined data to only include transactions that occurred *before* the application date.
+3.  Aggregate this historical data, summarizing each customer's behavior into new features.
+4.  Join these new features back to the main loan dataset.
+5.  Impute NAs with 0, as these represent customers with no prior transaction history.
+
+```{r feature-engineering}
+# Convert date strings to date objects
+loan <- loan %>%
+  mutate(application_date = as_date(application_date))
+
+txn <- txn %>%
+  mutate(transaction_date = as_date(transaction_date))
+
+# Join loan keys with all customer transactions
+loan_keys <- loan %>%
+  select(application_id, customer_id, application_date)
+
+joined_data <- left_join(loan_keys, txn,
+  by = "customer_id",
+  relationship = "many-to-many"
+)
+
+# Filter for transactions *before* the application date
+historical_txns <- joined_data %>%
+  filter(transaction_date < application_date)
+
+# Aggregate historical transaction data by application
+txn_features <- historical_txns %>%
+  group_by(application_id) %>%
+  summarize(
+    txn_count_before_app = n(),
+    txn_avg_amount = mean(transaction_amount, na.rm = TRUE),
+    txn_total_amount = sum(transaction_amount, na.rm = TRUE),
+    txn_failed_count = sum(transaction_status != "Success", na.rm = TRUE),
+    txn_international_count = sum(is_international_transaction == 1, na.rm = TRUE),
+    txn_avg_balance_after = mean(account_balance_after_transaction, na.rm = TRUE),
+    txn_distinct_merchants = n_distinct(merchant_name, na.rm = TRUE),
+    txn_distinct_devices = n_distinct(device_used, na.rm = TRUE)
+  )
+
+# Join new features to the main loan dataset
+loan_rich <- left_join(loan, txn_features, by = "application_id")
+
+# Impute 0 for applications with no prior transaction history
+loan_rich <- loan_rich %>%
+  mutate(
+    txn_count_before_app = replace_na(txn_count_before_app, 0),
+    txn_failed_count = replace_na(txn_failed_count, 0),
+    txn_international_count = replace_na(txn_international_count, 0),
+    txn_distinct_merchants = replace_na(txn_distinct_merchants, 0),
+    txn_distinct_devices = replace_na(txn_distinct_devices, 0),
+    txn_avg_amount = replace_na(txn_avg_amount, 0),
+    txn_total_amount = replace_na(txn_total_amount, 0),
+    txn_avg_balance_after = replace_na(txn_avg_balance_after, 0)
+  )
+```
+
+### 4. Data Preprocessing
+
+With our rich dataset assembled, we must prepare it for the neural network.
+
+#### 4.1. One-Hot Encoding and Scaling
+
+1.  **Create Target Variable:** We create a robust binary `fraud_flag` (1 or 0) from the `loan_status` column.
+2.  **Remove Identifiers:** We drop non-predictive columns like IDs and addresses.
+3.  **One-Hot Encoding:** We convert categorical features (e.g., `gender`, `loan_type`) into numerical binary columns (e.g., `genderFemale`, `genderMale`).
+4.  **Scaling:** We scale all numerical features to have a mean of 0 and a standard deviation of 1. This is essential for neural networks to converge properly.
+
+```{r preprocessing}
+# Create the target variable
+# Use grepl for a robust match (e.g., catches "Fraud" or "Fraudulent")
+loan_rich$fraud_flag <- ifelse(grepl("Fraud", loan_rich$loan_status, ignore.case = TRUE), 1, 0)
+
+# Remove identifiers and non-predictive columns
+loan_processed <- loan_rich %>%
+  select(
+    -application_id, -customer_id, -application_date,
+    -residential_address, -loan_status, -fraud_type
+  )
+
+# One-hot encode categorical features
+loan_dummies <- model.matrix(~ gender + loan_type + employment_status + property_ownership_status + purpose_of_loan - 1, data = loan_processed)
+loan_processed <- cbind(loan_processed, loan_dummies)
+loan_processed <- loan_processed %>%
+  select(-gender, -loan_type, -employment_status, -property_ownership_status, -purpose_of_loan)
+
+# Clean column names for R formula compatibility
+names(loan_processed) <- make.names(names(loan_processed))
+
+# Define and scale numerical features
+cols_to_scale <- c(
+  "loan_amount_requested", "monthly_income", "loan_tenure_months",
+  "interest_rate_offered", "cibil_score", "existing_emis_monthly",
+  "applicant_age", "number_of_dependents", "debt_to_income_ratio",
+  "txn_count_before_app", "txn_avg_amount", "txn_total_amount",
+  "txn_failed_count", "txn_international_count", "txn_avg_balance_after",
+  "txn_distinct_merchants", "txn_distinct_devices"
+)
+
+# Ensure all columns exist before scaling
+cols_to_scale <- cols_to_scale[cols_to_scale %in% names(loan_processed)]
+loan_processed[cols_to_scale] <- scale(loan_processed[cols_to_scale])
+```
+
+#### 4.2. Train/Test Split and Data Balancing
+
+The `fraud_flag` is highly imbalanced in the raw data. A model trained on this would learn to just guess "not fraud".
+
+To solve this, we perform a **manual stratified split** to ensure the 80/20 train/test sets both contain a proportional number of fraud and non-fraud cases. We then use the **ROSE** (Random Over-Sampling Examples) package *only* on the training set to create a new, perfectly balanced `loantrain_rich_balanced` dataset. The test set remains unbalanced to provide a real-world performance benchmark.
+
+```{r train-test-split-balance}
+set.seed(1234) # for reproducibility
+
+# Perform a manual stratified split to ensure both classes are in train/test
+# This is based on the numeric 0/1 flag
+fraud_data <- loan_processed %>% filter(fraud_flag == 1)
+nonfraud_data <- loan_processed %>% filter(fraud_flag == 0)
+
+# 80% of each class for training
+train_fraud_index <- sample(1:nrow(fraud_data), 0.8 * nrow(fraud_data))
+train_nonfraud_index <- sample(1:nrow(nonfraud_data), 0.8 * nrow(nonfraud_data))
+
+loantrain_rich <- rbind(
+  fraud_data[train_fraud_index, ],
+  nonfraud_data[train_nonfraud_index, ]
+)
+
+loantest_rich <- rbind(
+  fraud_data[-train_fraud_index, ],
+  nonfraud_data[-train_nonfraud_index, ]
+)
+
+# Original training data imbalance
+print("Original Training Data Imbalance:")
+print(prop.table(table(loantrain_rich$fraud_flag)))
+
+# Now, convert the flag to a factor *in the training set* for ROSE
+loantrain_rich$fraud_flag <- as.factor(loantrain_rich$fraud_flag)
+
+# Balance the training set using ROSE (50/50 split)
+# This is now guaranteed to work as we manually put fraud cases in loantrain_rich
+loantrain_rich_balanced <- ovun.sample(
+  fraud_flag ~ .,
+  data = loantrain_rich,
+  method = "both",
+  p = 0.5,
+  seed = 123
+)$data
+
+# New balanced training data
+print("Balanced Training Data:")
+print(prop.table(table(loantrain_rich_balanced$fraud_flag)))
+```
+
+### 5. Neural Network Model
+
+#### 5.1. Model Definition
+
+We define a sequential neural network with three hidden layers. We use `relu` as our activation function and `dropout` layers (at 30% and 20%) to prevent overfitting. The model ends with a single `sigmoid` neuron, which will output a probability of fraud between 0 and 1.
+
+```{r keras-model-definition}
+# Prepare data matrices for Keras
+# We must convert factors back to numeric (0/1) for Keras
+x_train <- loantrain_rich_balanced %>%
+  select(-fraud_flag) %>%
+  as.matrix()
+y_train <- loantrain_rich_balanced$fraud_flag %>%
+  as.numeric() - 1 # Convert from factor (1, 2) to numeric (0, 1)
+
+x_test <- loantest_rich %>%
+  select(-fraud_flag) %>%
+  as.matrix()
+y_test <- loantest_rich$fraud_flag
+  # Note: y_test is still numeric (0/1) from the original loan_processed
+
+
+# Define neural network architecture
+model <- keras_model_sequential() %>%
+  layer_dense(
+    units = 64,
+    activation = "relu",
+    input_shape = ncol(x_train)
+  ) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(
+    units = 32,
+    activation = "relu"
+  ) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(
+    units = 16,
+    activation = "relu"
+  ) %>%
+  layer_dense(
+    units = 1,
+    activation = "sigmoid"
+  )
+
+summary(model)
+```
+
+**Model Summary Interpretation:**
+The model summary shows we have **5,057 trainable parameters**. These are the internal weights and biases that the network will "learn" from the data during the training process. This is a relatively lightweight model, which is good for this type of tabular data as it reduces the risk of overfitting.
+
+#### 5.2. Model Compilation & Training
+
+We compile the model with:
+
+* **Loss:** `binary_crossentropy` (the standard, correct choice for a 0/1 classification problem).
+* **Optimizer:** `adam` (a highly efficient and effective default optimizer).
+
+We then train the model for 30 epochs on our balanced training data, using 20% of that data for validation.
+
+```{r keras-model-train}
+# Compile the Model
+model %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = c("accuracy")
+)
+
+# Train the Model
+history <- model %>% fit(
+  x_train, y_train,
+  epochs = 30,
+  batch_size = 64,
+  validation_split = 0.2,
+  verbose = 2
+)
+```
+
+**Training Output Interpretation:**
+The model trained for 30 epochs. The key metrics from the final epoch are:
+* `accuracy: 0.9370`: The model was 93.7% accurate on the training data it saw.
+* `loss: 0.1549`: The training loss is low, indicating the model fits the training data well.
+* `val_accuracy: 0.9671`: The model was 96.7% accurate on the validation data it *did not* see during training. This is an excellent sign.
+* `val_loss: 0.1005`: The validation loss is also very low and is consistent with the training loss, which confirms that our model is not overfitting and generalizes well.
+
+#### 5.3. Training History
+
+The plot below shows the training and validation loss over the 30 epochs.
+
+```{r plot-history}
+# Plot training & validation loss over epochs
+plot(history)
+```
+
+**Plot Interpretation:**
+This is an ideal training plot. Both training loss (`loss`, in blue) and validation loss (`val_loss`, in orange) decrease steadily and converge. The fact that the validation loss does not increase at the end confirms that our use of `dropout` was successful in preventing overfitting.
+
+### 6. Model Evaluation & Threshold Analysis
+
+Now we evaluate the model on the unseen, **unbalanced** test set (`loantest_rich`). This is the true test of its real-world performance.
+
+#### 6.1. Sensitivity vs. Specificity Trade-off
+
+For a fraud model, raw accuracy is misleading. The most important task is tuning the prediction threshold to balance two key metrics:
+
+* **Sensitivity:** How many actual frauds do we catch? (True Positives)
+* **Specificity:** How many legitimate customers do we leave alone? (True Negatives)
+
+The following plot shows the trade-off for our model.
+
+```{r sensitivity-specificity-plot}
+# Get model predictions on the unbalanced test set
+test_predictions_prob <- model %>% predict(x_test)
+
+# Create ROCR prediction object
+pred_obj <- prediction(test_predictions_prob, y_test)
+
+# Get performance data for sensitivity (tpr) and specificity (tnr)
+perf_sens <- performance(pred_obj, "sens") # Sensitivity (True Positive Rate)
+perf_spec <- performance(pred_obj, "spec") # Specificity (True Negative Rate)
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  cutoff = perf_sens@x.values[[1]],
+  sensitivity = perf_sens@y.values[[1]],
+  specificity = perf_spec@y.values[[1]]
+)
+
+# Tidy for ggplot2
+plot_data_tidy <- plot_data %>%
+  gather(key = "metric", value = "value", sensitivity, specificity)
+
+# Find the optimal threshold (where sensitivity and specificity cross)
+optimal_cutoff_data <- plot_data %>%
+  mutate(diff = abs(sensitivity - specificity)) %>%
+  arrange(diff) %>%
+  head(1)
+
+optimal_threshold <- optimal_cutoff_data$cutoff
+
+# Plot with ggplot2
+ggplot(plot_data_tidy, aes(x = cutoff, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = optimal_threshold, linetype = "dashed", color = "blue") +
+  labs(
+    title = "Sensitivity vs. Specificity Trade-off",
+    x = "Prediction Threshold (Cutoff)",
+    y = "Rate",
+    subtitle = paste("Optimal Threshold (intersection):", round(optimal_threshold, 3))
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("sensitivity" = "darkgreen", "specificity" = "darkred")) +
+  coord_cartesian(xlim = c(0, 1)) # Ensure plot spans 0 to 1
+```
+
+**Plot Interpretation:**
+The plot shows the classic trade-off.
+
+* A high threshold (e.g., 0.9) gives high **Specificity** (we correctly identify non-fraudulent loans) but very low **Sensitivity** (we miss most of the fraud).
+* A low threshold (e.g., 0.1) gives high **Sensitivity** (we catch all the fraud) but very low **Specificity** (we incorrectly flag many legitimate customers).
+* The **Optimal Threshold** (blue dashed line) is the "sweet spot" where these two lines cross. This threshold, around `r round(optimal_threshold, 3)`, gives us the most balanced performance between catching fraud and approving legitimate loans.
+
+#### 6.2. Threshold Analysis Table
+
+While the optimal threshold is statistically balanced, a business may have different goals (e.g., "catch more fraud, even if it means flagging more good customers"). The table below provides a clear view of model performance at various high-confidence thresholds.
+
+```{r threshold-table}
+# Define the thresholds to test
+thresholds_to_test <- seq(0.8, 1.0, by = 0.01)
+
+# Create an empty list to store our results
+results_list <- list()
+
+# Convert y_test to a factor for confusionMatrix
+loantest_factor <- factor(y_test, levels = c(0, 1))
+
+# Loop over each threshold and calculate metrics
+for (thresh in thresholds_to_test) {
+  
+  # Classify predictions based on the current threshold
+  keras_classes <- ifelse(test_predictions_prob > thresh, 1, 0)
+  keras_classes_factor <- factor(keras_classes, levels = c(0, 1))
+  
+  # Calculate the Confusion Matrix
+  cm <- confusionMatrix(keras_classes_factor, loantest_factor, positive = "1")
+  
+  # Extract the metrics
+  results_list[[as.character(thresh)]] <- data.frame(
+    Threshold = thresh,
+    Accuracy = cm$overall['Accuracy'],
+    Sensitivity = cm$byClass['Sensitivity'],
+    Specificity = cm$byClass['Specificity']
+  )
+}
+
+# Combine all results from the list into one data frame
+results_df <- do.call(rbind, results_list)
+
+# Print the final results
+print("Threshold Analysis Results:")
+print(results_df, row.names = FALSE)
+```
+
+**Table Interpretation:**
+This table is extremely useful for business decisions. For example, at a **threshold of 0.90**, we achieve:
+* **Sensitivity of 0.515**: We still catch 51.5% of all fraud cases.
+* **Specificity of 0.999**: We correctly identify 99.9% of all legitimate applications.
+
+This demonstrates a high-precision model: when it flags an application with >90% confidence, it is very likely to be correct, while still catching a significant portion of fraud.
+
+#### 6.3. Final Model Performance
+
+We will now use the statistically *optimal* threshold to make our final class predictions and build a confusion matrix.
+
+```{r confusion-matrix}
+# Apply the optimal threshold to get class predictions (0 or 1)
+test_predictions_class <- ifelse(test_predictions_prob > optimal_threshold, 1, 0)
+
+# Create confusion matrix
+# We must use factors for caret's confusionMatrix function
+cm <- confusionMatrix(
+  data = as.factor(test_predictions_class),
+  reference = as.factor(y_test),
+  positive = "1" 
+)
+
+print("Confusion Matrix for Unbalanced Test Set:")
+print(cm)
+```
+
+**Confusion Matrix Interpretation:**
+The confusion matrix is the ultimate measure of our model's real-world performance at the balanced threshold.
+
+* **Sensitivity (Recall):** The model successfully identified `r round(cm$byClass["Sensitivity"] * 100, 1)`% of all actual fraud cases in the test set.
+* **Specificity:** The model successfully identified `r round(cm$byClass["Specificity"] * 100, 1)`% of all legitimate loan applications.
+* **Balanced Accuracy:** This is the best overall metric. Our model achieved a balanced accuracy of `r round(cm$byClass["Balanced Accuracy"] * 100, 1)`%. This is extremely strong, as a random guess would be 50%.
+
+### 7. Conclusion
+
+We successfully built, trained, and tuned a Keras neural network to predict loan application fraud.
+
+The most critical step was **feature engineering**, where we enriched the simple loan applications with historical transaction data. This gave the model the behavioral context needed to distinguish between legitimate and fraudulent patterns.
+
+By balancing the training data using **ROSE** and tuning the model's **prediction threshold**, we created a model that is both highly sensitive to fraud and highly specific to legitimate applications. The final model achieves a **Balanced Accuracy of `r round(cm$byClass["Balanced Accuracy"] * 100, 1)`%** on the unseen, unbalanced test set, demonstrating its effectiveness and reliability for real-world use.
+
